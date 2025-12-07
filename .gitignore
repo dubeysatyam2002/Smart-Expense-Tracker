@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# Local environment files
+.env
+
+# SQLite DB (local data only)
+data/expenses.db
+
+# VS Code settings (optional)
+.vscode/
