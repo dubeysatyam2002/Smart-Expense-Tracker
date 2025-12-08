@@ -1,6 +1,7 @@
 import streamlit as st
 from datetime import date, timedelta
 import pandas as pd
+from passlib.hash import pbkdf2_sha256
 
 from config import APP_NAME, APP_ICON
 from database.db_manager import DatabaseManager
@@ -35,11 +36,193 @@ db = DatabaseManager()
 parser = NLPParser()
 
 
+# ---------- Auth utilities ----------
+
+def hash_password(password: str) -> str:
+    # pbkdf2_sha256 does not have the 72-byte limit and is pure Python
+    return pbkdf2_sha256.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    if not password_hash:
+        return False
+    return pbkdf2_sha256.verify(password, password_hash)
+
+
+def show_auth_screen():
+    """
+    Show Login / Sign up tabs.
+    If user logs in or signs up successfully, set st.session_state["user_id"].
+    """
+    st.subheader("Login or Create an Account")
+
+    tab_login, tab_signup = st.tabs(["🔑 Login", "📝 Sign up"])
+
+    # ----- Login tab -----
+    with tab_login:
+        login_username = st.text_input("Username", key="login_username")
+        login_password = st.text_input(
+            "Password", type="password", key="login_password"
+        )
+
+        if st.button("Login", key="login_button"):
+            if not login_username.strip() or not login_password:
+                st.error("Please enter both username and password.")
+            else:
+                user = db.get_user_by_username(login_username.strip())
+                if not user:
+                    st.error("User not found. Please check your username or sign up.")
+                else:
+                    if verify_password(login_password, user["password_hash"]):
+                        st.success(f"Welcome back, {user['username']}!")
+                        st.session_state["user_id"] = user["id"]
+                        st.session_state["username"] = user["username"]
+                        st.rerun()
+                    else:
+                        st.error("Incorrect password. Please try again.")
+
+        # ----- Forgot password (via recovery question) -----
+        with st.expander("Forgot password?"):
+            fp_username = st.text_input(
+                "Enter your username to reset password",
+                key="fp_username",
+            )
+
+            user_for_reset = None
+            if fp_username.strip():
+                user_for_reset = db.get_user_by_username(fp_username.strip())
+
+            if fp_username.strip() and not user_for_reset:
+                st.error("No user found with that username.")
+
+            if user_for_reset:
+                rq = user_for_reset.get("recovery_question")
+                rah = user_for_reset.get("recovery_answer_hash")
+
+                if not rq or not rah:
+                    st.info(
+                        "No recovery question is set for this account. "
+                        "Ask the admin/dev to reset your password manually."
+                    )
+                else:
+                    st.write(f"**Recovery question:** {rq}")
+
+                    fp_answer = st.text_input(
+                        "Recovery answer",
+                        type="password",
+                        key="fp_answer",
+                    )
+                    new_pw = st.text_input(
+                        "New password",
+                        type="password",
+                        key="fp_new_pw",
+                    )
+                    new_pw2 = st.text_input(
+                        "Confirm new password",
+                        type="password",
+                        key="fp_new_pw2",
+                    )
+
+                    if st.button("Reset password", key="fp_reset"):
+                        if not fp_answer or not new_pw or not new_pw2:
+                            st.error("Please fill all fields.")
+                        elif new_pw != new_pw2:
+                            st.error("New passwords do not match.")
+                        else:
+                            if not verify_password(fp_answer, rah):
+                                st.error("Recovery answer is incorrect.")
+                            else:
+                                new_hash = hash_password(new_pw)
+                                db.update_user_password(
+                                    user_id=user_for_reset["id"],
+                                    new_password_hash=new_hash,
+                                )
+                                st.success(
+                                    "Password reset successfully. "
+                                    "You can now log in with your new password."
+                                )
+
+    # ----- Signup tab -----
+    with tab_signup:
+        signup_username = st.text_input("Choose a username", key="signup_username")
+        signup_password = st.text_input(
+            "Choose a password", type="password", key="signup_password"
+        )
+        signup_password2 = st.text_input(
+            "Confirm password", type="password", key="signup_password2"
+        )
+
+        st.markdown("**Optional: set a recovery question for 'Forgot password'**")
+        signup_recovery_question = st.text_input(
+            "Recovery question (e.g. 'Your favourite city?')",
+            key="signup_recovery_question",
+        )
+        signup_recovery_answer = st.text_input(
+            "Recovery answer",
+            type="password",
+            key="signup_recovery_answer",
+        )
+
+        if st.button("Create Account", key="signup_button"):
+            if not signup_username.strip():
+                st.error("Username is required.")
+            elif not signup_password:
+                st.error("Password is required.")
+            elif signup_password != signup_password2:
+                st.error("Passwords do not match.")
+            else:
+                # Check if username exists
+                existing = db.get_user_by_username(signup_username.strip())
+                if existing:
+                    st.error("Username already taken. Please choose another.")
+                else:
+                    pw_hash = hash_password(signup_password)
+
+                    rq = signup_recovery_question.strip() or None
+                    if signup_recovery_answer:
+                        ra_hash = hash_password(signup_recovery_answer)
+                    else:
+                        ra_hash = None
+
+                    user_id = db.create_user(
+                        signup_username.strip(),
+                        pw_hash,
+                        rq,
+                        ra_hash,
+                    )
+                    if user_id is None:
+                        st.error("Could not create user (username may already exist).")
+                    else:
+                        st.success("Account created! You are now logged in.")
+                        st.session_state["user_id"] = user_id
+                        st.session_state["username"] = signup_username.strip()
+                        st.rerun()
+# ---------- Authentication gate ----------
+
+if "user_id" not in st.session_state:
+    # Not logged in → show auth and stop
+    show_auth_screen()
+    st.stop()
+
+# Now we know the user is logged in
+CURRENT_USER_ID = st.session_state["user_id"]
+CURRENT_USERNAME = st.session_state.get("username", "user")
+
+# ---------- Sidebar: show logged-in user & logout ----------
+
+st.sidebar.markdown(f"**Logged in as:** `{CURRENT_USERNAME}`")
+if st.sidebar.button("Logout"):
+    st.session_state.clear()
+    st.rerun()
+
+st.sidebar.markdown("---")
+
+
 # ---------- Sidebar: Account selection & management ----------
 
 st.sidebar.header("Accounts")
 
-accounts = db.get_all_accounts()
+accounts = db.get_all_accounts(user_id=CURRENT_USER_ID)
 selected_account = None
 
 # --- Select existing account ---
@@ -67,11 +250,16 @@ with st.sidebar.form("add_account_form"):
 
     if submitted:
         if new_acc_name.strip():
-            acc_id = db.add_account(new_acc_name.strip(), new_acc_desc.strip())
+            acc_id = db.add_account(
+                CURRENT_USER_ID,
+                new_acc_name.strip(),
+                new_acc_desc.strip(),
+            )
             if acc_id:
                 st.sidebar.success("Account created! Please refresh or rerun.")
+                st.rerun()
             else:
-                st.sidebar.error("Account name already exists.")
+                st.sidebar.error("Account name already exists for this user.")
         else:
             st.sidebar.error("Account name required.")
 
@@ -91,7 +279,7 @@ if accounts:
     if st.sidebar.button("Delete Selected Account"):
         if confirm_delete:
             acc_to_delete = next(a for a in accounts if a["name"] == del_acc_name)
-            db.delete_account(acc_to_delete["id"])
+            db.delete_account(acc_to_delete["id"], user_id=CURRENT_USER_ID)
             st.sidebar.success(f"Deleted account '{del_acc_name}'.")
             st.rerun()
         else:
@@ -126,7 +314,7 @@ if selected_account:
     # ---------- Account Summary Section ----------
     summary = db.get_account_summary(account_id=selected_account["id"])
 
-    st.subheader("Account Summary")
+    st.subheader(f"Account Summary — {selected_account['name']}")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Income", f"₹ {summary['total_income']:.2f}")
@@ -425,4 +613,4 @@ if selected_account:
                     st.error(f"Error deleting transaction: {e}")
 
 else:
-    st.warning("Please select an account or create one from the sidebar.")
+    st.warning("Please create an account from the sidebar to begin.")

@@ -1,284 +1,300 @@
-"""
-DatabaseManager: handles all SQLite operations for the expense tracker.
-"""
-
 import os
 import sqlite3
-from typing import List, Dict, Any, Optional
-from datetime import date
-
-from config import DB_PATH
+from typing import Optional, List, Dict, Any
 
 
-def _dict_factory(cursor: sqlite3.Cursor, row: sqlite3.Row) -> Dict[str, Any]:
-    """
-    Convert SQLite rows to dictionaries: {"column": value, ...}
-    """
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+DB_PATH = os.path.join("data", "expenses.db")
+SCHEMA_PATH = os.path.join("database", "schema.sql")
 
 
 class DatabaseManager:
     """
-    Wrapper around SQLite for accounts and transactions.
+    Handles all DB operations:
+    - users
+    - accounts (per user)
+    - transactions
     """
 
-    def __init__(self, db_path: str = DB_PATH) -> None:
-        self.db_path = db_path
-        # Ensure the data folder exists
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        # Initialize database schema (tables + indexes)
-        self._initialize_database()
+    def __init__(self, db_path: str = DB_PATH, schema_path: str = SCHEMA_PATH) -> None:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-    # ---------- Internal helpers ----------
+        self.conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON;")
 
-    def _get_connection(self) -> sqlite3.Connection:
-        """
-        Create a new SQLite connection.
-        Row factory makes results come back as dictionaries.
-        """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = _dict_factory
-        return conn
+        self._initialize_db(schema_path)
 
-    def _initialize_database(self) -> None:
-        """
-        Run schema.sql to create tables and indexes if they don't exist.
-        """
-        schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+    # ---------- Initialization ----------
+
+    def _initialize_db(self, schema_path: str) -> None:
+        """Create tables if they don't exist."""
         with open(schema_path, "r", encoding="utf-8") as f:
             schema_sql = f.read()
 
-        with self._get_connection() as conn:
-            conn.executescript(schema_sql)
+        self.conn.executescript(schema_sql)
+        self.conn.commit()
 
-    # ---------- Account methods ----------
+    # ---------- User management ----------
 
-    def add_account(self, name: str, description: str = "") -> Optional[int]:
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        recovery_question: Optional[str] = None,
+        recovery_answer_hash: Optional[str] = None,
+    ) -> Optional[int]:
         """
-        Create a new account.
-        Returns the new account ID, or None if the name already exists.
+        Create a new user.
+        Returns user_id if created, or None if username already exists.
         """
         try:
-            with self._get_connection() as conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO accounts (name, description)
-                    VALUES (?, ?)
-                    """,
-                    (name, description),
-                )
-                return cursor.lastrowid
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO users (username, password_hash, recovery_question, recovery_answer_hash)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, password_hash, recovery_question, recovery_answer_hash),
+            )
+            self.conn.commit()
+            return cur.lastrowid
         except sqlite3.IntegrityError:
-            # UNIQUE constraint failed (duplicate name)
+            # UNIQUE(username) violated
             return None
 
-    def get_all_accounts(self) -> List[Dict[str, Any]]:
+    def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_user_password(self, user_id: int, new_password_hash: str) -> None:
         """
-        Return all accounts as a list of dictionaries.
+        Update the password hash for a user (used by 'forgot password' flow).
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT id, name, description, created_at FROM accounts ORDER BY id;"
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE users
+            SET password_hash = ?
+            WHERE id = ?
+            """,
+            (new_password_hash, user_id),
+        )
+        self.conn.commit()
+
+    # ---------- Account management (per user) ----------
+
+    def add_account(self, user_id: int, name: str, description: str = "") -> Optional[int]:
+        """
+        Create an account for a given user.
+        Returns account_id if created, or None if (user_id, name) already exists.
+        """
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO accounts (user_id, name, description)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, name, description),
             )
-            return cursor.fetchall()
+            self.conn.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
 
-    def delete_account(self, account_id: int) -> None:
+    def get_all_accounts(self, user_id: int) -> List[Dict[str, Any]]:
         """
-        Delete an account (and its transactions due to ON DELETE CASCADE).
+        Return all accounts belonging to this user.
         """
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM accounts WHERE id = ?;", (account_id,))
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_id, name, description, created_at
+            FROM accounts
+            WHERE user_id = ?
+            ORDER BY created_at
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
 
-    # ---------- Transaction methods ----------
+    def delete_account(self, account_id: int, user_id: Optional[int] = None) -> None:
+        """
+        Delete an account (and cascade-delete its transactions).
+        If user_id is given, ensures the account belongs to that user.
+        """
+        cur = self.conn.cursor()
+        if user_id is not None:
+            cur.execute(
+                "DELETE FROM accounts WHERE id = ? AND user_id = ?",
+                (account_id, user_id),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM accounts WHERE id = ?",
+                (account_id,),
+            )
+        self.conn.commit()
+
+    # ---------- Transaction management ----------
 
     def add_transaction(
         self,
         account_id: int,
         trans_type: str,
         amount: float,
-        description: str = "",
-        category: str = "",
-        transaction_date: Optional[str] = None,
+        description: str,
+        category: str,
+        transaction_date: str,
     ) -> int:
-        """
-        Add a new transaction (income or expense).
-        transaction_date: 'YYYY-MM-DD' string. If None, today's date is used.
-        Returns new transaction ID.
-        """
-        trans_type = trans_type.lower()
-        if trans_type not in ("income", "expense"):
-            raise ValueError("trans_type must be 'income' or 'expense'")
-
-        if amount <= 0:
-            raise ValueError("amount must be > 0")
-
-        if transaction_date is None:
-            transaction_date = date.today().isoformat()
-
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO transactions (
-                    account_id, type, amount, description, category, transaction_date
-                )
-                VALUES (?, ?, ?, ?, ?, ?);
-                """,
-                (account_id, trans_type, amount, description, category, transaction_date),
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO transactions (
+                account_id, type, amount, description, category, transaction_date
             )
-            return cursor.lastrowid
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (account_id, trans_type, amount, description, category, transaction_date),
+        )
+        self.conn.commit()
+        return cur.lastrowid
 
     def get_transactions(
         self,
-        account_id: Optional[int] = None,
+        account_id: int,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         trans_type: Optional[str] = None,
         category: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Fetch transactions with optional filters.
-        Dates are 'YYYY-MM-DD' strings.
+        Fetch transactions for a given account with optional filters.
         """
-        query = """
-            SELECT
-                id, account_id, type, amount, description,
-                category, transaction_date, created_at
-            FROM transactions
-            WHERE 1 = 1
-        """
-        params: List[Any] = []
-
-        if account_id is not None:
-            query += " AND account_id = ?"
-            params.append(account_id)
+        query = [
+            "SELECT id, account_id, type, amount, description, category,",
+            "       transaction_date, created_at",
+            "FROM transactions",
+            "WHERE account_id = ?",
+        ]
+        params: List[Any] = [account_id]
 
         if start_date is not None:
-            query += " AND transaction_date >= ?"
+            query.append("AND transaction_date >= ?")
             params.append(start_date)
 
         if end_date is not None:
-            query += " AND transaction_date <= ?"
+            query.append("AND transaction_date <= ?")
             params.append(end_date)
 
         if trans_type is not None:
-            query += " AND type = ?"
-            params.append(trans_type.lower())
+            query.append("AND type = ?")
+            params.append(trans_type)
 
         if category is not None:
-            query += " AND category = ?"
+            query.append("AND LOWER(category) = LOWER(?)")
             params.append(category)
 
-        query += " ORDER BY transaction_date ASC, id ASC;"
+        query.append("ORDER BY transaction_date DESC, id DESC")
 
-        with self._get_connection() as conn:
-            cursor = conn.execute(query, params)
-            return cursor.fetchall()
+        sql = " ".join(query)
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
 
     def update_transaction(
         self,
         transaction_id: int,
-        *,
-        trans_type: Optional[str] = None,
-        amount: Optional[float] = None,
-        description: Optional[str] = None,
-        category: Optional[str] = None,
-        transaction_date: Optional[str] = None,
+        trans_type: str,
+        amount: float,
+        description: str,
+        category: str,
+        transaction_date: str,
     ) -> None:
-        """
-        Update fields of a transaction.
-        Only non-None arguments will be updated.
-        """
-        fields = []
-        params: List[Any] = []
-
-        if trans_type is not None:
-            trans_type = trans_type.lower()
-            if trans_type not in ("income", "expense"):
-                raise ValueError("trans_type must be 'income' or 'expense'")
-            fields.append("type = ?")
-            params.append(trans_type)
-
-        if amount is not None:
-            if amount <= 0:
-                raise ValueError("amount must be > 0")
-            fields.append("amount = ?")
-            params.append(amount)
-
-        if description is not None:
-            fields.append("description = ?")
-            params.append(description)
-
-        if category is not None:
-            fields.append("category = ?")
-            params.append(category)
-
-        if transaction_date is not None:
-            fields.append("transaction_date = ?")
-            params.append(transaction_date)
-
-        if not fields:
-            # Nothing to update
-            return
-
-        params.append(transaction_id)
-        set_clause = ", ".join(fields)
-
-        query = f"UPDATE transactions SET {set_clause} WHERE id = ?;"
-
-        with self._get_connection() as conn:
-            conn.execute(query, params)
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE transactions
+            SET type = ?,
+                amount = ?,
+                description = ?,
+                category = ?,
+                transaction_date = ?
+            WHERE id = ?
+            """,
+            (trans_type, amount, description, category, transaction_date, transaction_id),
+        )
+        self.conn.commit()
 
     def delete_transaction(self, transaction_id: int) -> None:
-        """
-        Delete a transaction by ID.
-        """
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM transactions WHERE id = ?;", (transaction_id,))
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM transactions WHERE id = ?",
+            (transaction_id,),
+        )
+        self.conn.commit()
 
-    # ---------- Summary / analytics helpers ----------
+    # ---------- Summary / analytics ----------
 
     def get_account_summary(
         self,
         account_id: int,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, float]:
         """
-        Return summary for an account:
-        - total_income
-        - total_expense
-        - balance
-        - transaction_count
+        Calculate total income, total expense, and balance for an account.
+        Optional date range filter.
         """
-        query = """
-            SELECT
-                COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
-                COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense,
-                COUNT(*) AS transaction_count
-            FROM transactions
-            WHERE account_id = ?
-        """
+        conditions = ["account_id = ?"]
         params: List[Any] = [account_id]
 
         if start_date is not None:
-            query += " AND transaction_date >= ?"
+            conditions.append("transaction_date >= ?")
             params.append(start_date)
 
         if end_date is not None:
-            query += " AND transaction_date <= ?"
+            conditions.append("transaction_date <= ?")
             params.append(end_date)
 
-        with self._get_connection() as conn:
-            cursor = conn.execute(query, params)
-            row = cursor.fetchone()
+        where_clause = " AND ".join(conditions)
 
-        total_income = row["total_income"]
-        total_expense = row["total_expense"]
-        balance = total_income - total_expense
+        sql = f"""
+            SELECT
+                SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END) AS total_income,
+                SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END) AS total_expense
+            FROM transactions
+            WHERE {where_clause}
+        """
+
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+
+        total_income = row["total_income"] if row["total_income"] is not None else 0.0
+        total_expense = row["total_expense"] if row["total_expense"] is not None else 0.0
 
         return {
-            "total_income": total_income,
-            "total_expense": total_expense,
-            "balance": balance,
-            "transaction_count": row["transaction_count"],
+            "total_income": float(total_income),
+            "total_expense": float(total_expense),
+            "balance": float(total_income - total_expense),
         }
+
+    def close(self) -> None:
+        self.conn.close()
