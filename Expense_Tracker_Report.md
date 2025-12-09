@@ -1750,6 +1750,6 @@ st.rerun()
 
 **End of Report**
 
-This comprehensive report covers every aspect of your Smart Expense Tracker project. The code, architecture, and explanations are designed for learning, so you (or anyone else) can pick it up later and understand exactly how everything works.
+This comprehensive report covers every aspect of this Smart Expense Tracker project. The code, architecture, and explanations are designed for learning, so you (or anyone else) can pick it up later and understand exactly how everything works.
 
 Happy learning! 🚀
