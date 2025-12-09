@@ -84,7 +84,7 @@ Streamlit displays charts to user
 
 ---
 
-## Part 3: Learning Path for This Project
+## Part 3: Learning Path for This Project ("You can do it at your own pace")
 
 ### Week 1: Foundations
 **Goal**: Understand how everything works together
@@ -713,5 +713,4 @@ By understanding each component and how they work together, you've gained knowle
 
 ---
 
-*Document Version 1.0 - Created December 2024*
-*For questions or suggestions, refer to the main project documentation.*
+*Document Version 1.0 - Created December 2025*
